@@ -1,7 +1,8 @@
 export IMAGE_REPO                ?= quay.io/operator-framework/catalogd
+export SERVER_IMAGE_REPO		 ?= quay.io/operator-framework/catalogd-server
 export IMAGE_TAG                 ?= devel
 IMAGE=$(IMAGE_REPO):$(IMAGE_TAG)
-
+SERVER_IMAGE=$(SERVER_IMAGE_REPO):$(IMAGE_TAG)
 # setup-envtest on *nix uses XDG_DATA_HOME, falling back to HOME, as the default storage directory. Some CI setups
 # don't have XDG_DATA_HOME set; in those cases, we set it here so setup-envtest functions correctly. This shouldn't
 # affect developers.
@@ -48,6 +49,7 @@ clean: ## Remove binaries and test artifacts
 generate: $(CONTROLLER_GEN) ## Generate code and manifests.
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	rm config/crd/bases/optional.catalogd.operatorframework.io_catalogmetadata.yaml
 
 .PHONY: fmt
 fmt: ## Run go fmt against code.
@@ -83,7 +85,7 @@ lint: $(GOLANGCI_LINT) ## Run golangci linter.
 
 ##@ Build
 
-BINARIES=manager
+BINARIES=manager server
 LINUX_BINARIES=$(join $(addprefix linux/,$(BINARIES)), )
 
 # Build info
@@ -130,7 +132,7 @@ run: generate kind-cluster install ## Create a kind cluster and install a local 
 .PHONY: build-container
 build-container: build-linux ## Build docker image for catalogd.
 	docker build -f Dockerfile -t $(IMAGE) bin/linux
-
+	docker build -f server.Dockerfile -t $(SERVER_IMAGE) bin/linux
 ##@ Deploy
 
 .PHONY: kind-cluster
@@ -146,13 +148,14 @@ kind-cluster-cleanup: $(KIND) ## Delete the kind cluster
 kind-load: $(KIND) ## Load the built images onto the local cluster
 	$(KIND) export kubeconfig --name $(KIND_CLUSTER_NAME)
 	$(KIND) load docker-image $(IMAGE) --name $(KIND_CLUSTER_NAME)
+	$(KIND) load docker-image $(SERVER_IMAGE) --name $(KIND_CLUSTER_NAME)
 
 kind-load-test-artifacts: $(KIND) ## Load the e2e testdata container images into a kind cluster
 	$(CONTAINER_RUNTIME) build $(TESTDATA_DIR)/catalogs -f $(TESTDATA_DIR)/catalogs/test-catalog.Dockerfile -t localhost/testdata/catalogs/test-catalog:e2e
 	$(KIND) load docker-image localhost/testdata/catalogs/test-catalog:e2e --name $(KIND_CLUSTER_NAME)
 
 .PHONY: install
-install: build-container kind-load deploy wait ## Install local catalogd
+install: cert-manager build-container kind-load deploy wait ## Install local catalogd
 
 .PHONY: deploy
 deploy: $(KUSTOMIZE) ## Deploy Catalogd to the K8s cluster specified in ~/.kube/config.
@@ -163,14 +166,21 @@ deploy: $(KUSTOMIZE) ## Deploy Catalogd to the K8s cluster specified in ~/.kube/
 undeploy: $(KUSTOMIZE) ## Undeploy Catalogd from the K8s cluster specified in ~/.kube/config.
 	$(KUSTOMIZE) build config/default | kubectl delete --ignore-not-found=true -f -
 
+.PHONY: cert-manager
+cert-manager: ## Deploy cert-manager on the cluster
+	kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/$(CERT_MGR_VERSION)/cert-manager.yaml
+	kubectl	wait --for=condition=Available --namespace=cert-manager deployment/cert-manager --timeout=60s
+	kubectl	wait --for=condition=Available --namespace=cert-manager deployment/cert-manager-cainjector --timeout=60s
+	kubectl	wait --for=condition=Available --namespace=cert-manager deployment/cert-manager-webhook --timeout=60s
+
 wait:
 	kubectl wait --for=condition=Available --namespace=$(CATALOGD_NAMESPACE) deployment/catalogd-controller-manager --timeout=60s
+	kubectl wait --for=condition=Available --namespace=$(CATALOGD_NAMESPACE) deployment/catalogd-server --timeout=60s
 
 ##@ Release
 
 export ENABLE_RELEASE_PIPELINE ?= false
 export GORELEASER_ARGS         ?= --snapshot --clean
-export CERT_MGR_VERSION        ?= $(CERT_MGR_VERSION)
 release: $(GORELEASER) ## Runs goreleaser for catalogd. By default, this will run only as a snapshot and will not publish any artifacts unless it is run with different arguments. To override the arguments, run with "GORELEASER_ARGS=...". When run as a github action from a tag, this target will publish a full release.
 	$(GORELEASER) $(GORELEASER_ARGS)
 
