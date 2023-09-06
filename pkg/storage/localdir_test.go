@@ -2,7 +2,10 @@ package storage
 
 import (
 	"fmt"
+	"io"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing/fstest"
@@ -34,8 +37,8 @@ var _ = Describe("LocalDir Storage Test", func() {
 	)
 	BeforeEach(func() {
 		d, err := os.MkdirTemp(GinkgoT().TempDir(), "cache")
-		rootDir = d
 		Expect(err).ToNot(HaveOccurred())
+		rootDir = d
 
 		store = LocalDir{RootDir: rootDir}
 		unpackResultFS = &fstest.MapFS{
@@ -75,6 +78,63 @@ var _ = Describe("LocalDir Storage Test", func() {
 		})
 	})
 })
+
+var _ = Describe("LocalDir Server Handler tests", Ordered, func() {
+	var (
+		testServer httptest.Server
+		store      LocalDir
+	)
+	BeforeAll(func() {
+		d, err := os.MkdirTemp(GinkgoT().TempDir(), "cache")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(os.Mkdir(filepath.Join(d, "test-catalog"), 0700)).To(Succeed())
+		store = LocalDir{RootDir: d}
+		testServer = *httptest.NewServer(store.StorageServerHandler())
+
+	})
+	It("gets 404 for the path /", func() {
+		fmt.Println("here")
+		expectNotFound(testServer.URL)
+	})
+	It("gets 404 for the path /catalogs", func() {
+		expectNotFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs"))
+	})
+	It("gets 404 for the path /catalogs/test-catalog/", func() {
+		expectNotFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs/test-catalog/"))
+	})
+	It("gets 200 for the path /catalogs/test-catalog/foo.txt", func() {
+		expectedContent := []byte("bar")
+		Expect(os.WriteFile(filepath.Join(store.RootDir, "test-catalog", "foo.txt"), expectedContent, 0600)).To(Succeed())
+		expectFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs/test-catalog/foo.txt"), expectedContent)
+	})
+	It("gets 404 for the path /test-catalog/foo.txt", func() {
+		expectedContent := []byte("bar")
+		Expect(os.WriteFile(filepath.Join(store.RootDir, "test-catalog", "foo.txt"), expectedContent, 0600)).To(Succeed())
+		expectNotFound(fmt.Sprintf("%s/%s", testServer.URL, "/test-catalog/foo.txt"))
+	})
+	AfterAll(func() {
+		fmt.Println("here again")
+		testServer.Close()
+	})
+})
+
+func expectNotFound(url string) {
+	resp, err := http.Get(url)
+	Expect(err).To(Not(HaveOccurred()))
+	Expect(resp.StatusCode).To(Equal(http.StatusNotFound))
+	fmt.Println(resp.StatusCode)
+	Expect(resp.Body.Close()).To(Succeed())
+}
+
+func expectFound(url string, expectedContent []byte) {
+	resp, err := http.Get(url)
+	Expect(err).To(Not(HaveOccurred()))
+	Expect(resp.StatusCode).To(Equal(http.StatusOK))
+	actualContent, err := io.ReadAll(resp.Body)
+	Expect(err).To(Not(HaveOccurred()))
+	Expect(actualContent).To(Equal(expectedContent))
+	Expect(resp.Body.Close()).To(Succeed())
+}
 
 const testBundleTemplate = `---
 image: %s
