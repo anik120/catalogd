@@ -69,7 +69,7 @@ var _ = Describe("LocalDir Storage Test", func() {
 			Expect(err).To(Not(HaveOccurred()))
 		})
 		It("should store the content in the RootDir correctly", func() {
-			fbcFile := filepath.Join(rootDir, fmt.Sprintf("%s.jsonl", catalog))
+			fbcFile := filepath.Join(rootDir, catalog, "catalog.jsonl")
 			_, err := os.Stat(fbcFile)
 			Expect(err).To(Not(HaveOccurred()))
 
@@ -118,7 +118,6 @@ var _ = Describe("LocalDir Server Handler tests", func() {
 		d := GinkgoT().TempDir()
 		store = LocalDirV1{RootDir: d, RootURL: &url.URL{Path: urlPrefix}}
 		testServer = httptest.NewServer(store.StorageServerHandler())
-
 	})
 	It("gets 404 for the path /", func() {
 		expectNotFound(testServer.URL)
@@ -138,22 +137,22 @@ var _ = Describe("LocalDir Server Handler tests", func() {
 	It("gets 404 for the path /catalogs/test-catalog.jsonl", func() {
 		// This is actually how the file is stored, but we don't serve
 		// the filesystem, we serve an API. Hence, expect 404 not found
-		Expect(os.WriteFile(filepath.Join(store.RootDir, "test-catalog.jsonl"), []byte("foobar"), 0600)).To(Succeed())
+		Expect(writeFile(filepath.Join(store.RootDir, "test-catalog.jsonl"), []byte("foobar"), 0600)).To(Succeed())
 		expectNotFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs/test-catalog.jsonl"))
 	})
 	It("gets 200 for the path /catalogs/test-catalog/api/v1/all", func() {
 		expectedContent := []byte(`{"foo":"bar"}`)
-		Expect(os.WriteFile(filepath.Join(store.RootDir, "test-catalog.jsonl"), expectedContent, 0600)).To(Succeed())
+		Expect(writeFile(filepath.Join(store.RootDir, "test-catalog", "catalog.jsonl"), expectedContent, 0600)).To(Succeed())
 		expectFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs/test-catalog/api/v1/all"), expectedContent, false)
 	})
 	It("ignores accept-encoding for the path /catalogs/test-catalog/api/v1/all with size < 1400 bytes", func() {
 		expectedContent := []byte(`{"foo":"bar"}`)
-		Expect(os.WriteFile(filepath.Join(store.RootDir, "test-catalog.jsonl"), expectedContent, 0600)).To(Succeed())
+		Expect(writeFile(filepath.Join(store.RootDir, "test-catalog", "catalog.jsonl"), expectedContent, 0600)).To(Succeed())
 		expectFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs/test-catalog/api/v1/all"), expectedContent, false)
 	})
 	It("provides gzipped content for the path /catalogs/test-catalog/api/v1/all with size > 1400 bytes", func() {
 		expectedContent := []byte(testCompressableJSON)
-		Expect(os.WriteFile(filepath.Join(store.RootDir, "test-catalog.jsonl"), expectedContent, 0600)).To(Succeed())
+		Expect(writeFile(filepath.Join(store.RootDir, "test-catalog", "catalog.jsonl"), expectedContent, 0600)).To(Succeed())
 		expectFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs/test-catalog/api/v1/all"), expectedContent, true)
 	})
 	It("provides json-lines format for the served JSON catalog", func() {
@@ -190,6 +189,13 @@ var _ = Describe("LocalDir Server Handler tests", func() {
 		testServer.Close()
 	})
 })
+
+func writeFile(path string, content []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, content, mode)
+}
 
 func expectNotFound(url string) {
 	resp, err := http.Get(url) //nolint:gosec

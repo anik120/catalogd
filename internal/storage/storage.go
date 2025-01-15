@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"io"
 	"io/fs"
 	"net/http"
+	"os"
 )
 
 // Instance is a storage instance that stores FBC content of catalogs
@@ -17,4 +19,11 @@ type Instance interface {
 
 	BaseURL(catalog string) string
 	StorageServerHandler() http.Handler
+}
+
+type Handler interface {
+	Prepare(rootDir string, r io.Reader) error
+	Path() string
+	HandlerForCatalog(catalogName string, catalogFile *os.File) http.Handler
+	ContentExists(catalog string) bool
 }
