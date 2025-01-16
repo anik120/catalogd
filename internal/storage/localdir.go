@@ -34,6 +34,8 @@ type LocalDirV1 struct {
 	sf singleflight.Group
 }
 
+var _ Instance = &LocalDirV1{}
+
 func (s *LocalDirV1) Store(ctx context.Context, catalog string, fsys fs.FS) error {
 	s.m.Lock()
 	defer s.m.Unlock()

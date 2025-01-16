@@ -8,19 +8,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"testing"
 	"testing/fstest"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-
 	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
 	"sigs.k8s.io/yaml"
 
 	"github.com/operator-framework/operator-registry/alpha/declcfg"
@@ -30,207 +28,237 @@ const urlPrefix = "/catalogs/"
 
 var ctx = context.Background()
 
-var _ = Describe("LocalDir Storage Test", func() {
-	var (
-		catalog                     = "test-catalog"
-		store                       Instance
-		rootDir                     string
-		baseURL                     *url.URL
-		testBundleName              = "bundle.v0.0.1"
-		testBundleImage             = "quaydock.io/namespace/bundle:0.0.3"
-		testBundleRelatedImageName  = "test"
-		testBundleRelatedImageImage = "testimage:latest"
-		testBundleObjectData        = "dW5pbXBvcnRhbnQK"
-		testPackageDefaultChannel   = "preview_test"
-		testPackageName             = "webhook_operator_test"
-		testChannelName             = "preview_test"
-		testPackage                 = fmt.Sprintf(testPackageTemplate, testPackageDefaultChannel, testPackageName)
-		testBundle                  = fmt.Sprintf(testBundleTemplate, testBundleImage, testBundleName, testPackageName, testBundleRelatedImageName, testBundleRelatedImageImage, testBundleObjectData)
-		testChannel                 = fmt.Sprintf(testChannelTemplate, testPackageName, testChannelName, testBundleName)
+func TestLocalDirStorage(t *testing.T) {
+	catalog := "test-catalog"
+	testBundleName := "bundle.v0.0.1"
+	testBundleImage := "quaydock.io/namespace/bundle:0.0.3"
+	testBundleRelatedImageName := "test"
+	testBundleRelatedImageImage := "testimage:latest"
+	testBundleObjectData := "dW5pbXBvcnRhbnQK"
+	testPackageDefaultChannel := "preview_test"
+	testPackageName := "webhook_operator_test"
+	testChannelName := "preview_test"
 
-		unpackResultFS fs.FS
-	)
-	BeforeEach(func() {
-		d, err := os.MkdirTemp(GinkgoT().TempDir(), "cache")
-		Expect(err).ToNot(HaveOccurred())
-		rootDir = d
+	testPackage := fmt.Sprintf(testPackageTemplate, testPackageDefaultChannel, testPackageName)
+	testBundle := fmt.Sprintf(testBundleTemplate, testBundleImage, testBundleName, testPackageName, testBundleRelatedImageName, testBundleRelatedImageImage, testBundleObjectData)
+	testChannel := fmt.Sprintf(testChannelTemplate, testPackageName, testChannelName, testBundleName)
 
-		baseURL = &url.URL{Scheme: "http", Host: "test-addr", Path: urlPrefix}
-		store = &LocalDirV1{RootDir: rootDir, RootURL: baseURL}
-		unpackResultFS = &fstest.MapFS{
-			"bundle.yaml":  &fstest.MapFile{Data: []byte(testBundle), Mode: os.ModePerm},
-			"package.yaml": &fstest.MapFile{Data: []byte(testPackage), Mode: os.ModePerm},
-			"channel.yaml": &fstest.MapFile{Data: []byte(testChannel), Mode: os.ModePerm},
+	baseURL := &url.URL{Scheme: "http", Host: "test-addr", Path: urlPrefix}
+	rootDir := t.TempDir()
+	store := &LocalDirV1{RootDir: rootDir, RootURL: baseURL}
+	unpackResult := &fstest.MapFS{
+		"bundle.yaml":  {Data: []byte(testBundle), Mode: os.ModePerm},
+		"package.yaml": {Data: []byte(testPackage), Mode: os.ModePerm},
+		"channel.yaml": {Data: []byte(testChannel), Mode: os.ModePerm},
+	}
+	err := store.Store(ctx, catalog, unpackResult)
+	require.NoError(t, err)
+
+	// Verify stored content
+	fbcFile := filepath.Join(rootDir, catalog, "catalog.jsonl")
+	_, err = os.Stat(fbcFile)
+	require.NoError(t, err)
+
+	gotConfig, err := declcfg.LoadFS(ctx, unpackResult)
+	require.NoError(t, err)
+	storedConfig, err := declcfg.LoadFile(os.DirFS(filepath.Dir(fbcFile)), filepath.Base(fbcFile))
+	require.NoError(t, err)
+
+	require.Equal(t, cmp.Diff(gotConfig, storedConfig), "")
+
+	// Verify content URL
+	expectedURL := baseURL.JoinPath(catalog).String()
+	require.Equal(t, expectedURL, store.BaseURL(catalog))
+
+	require.True(t, store.ContentExists(catalog))
+
+	// Delete stored content
+	err = store.Delete(catalog)
+	require.NoError(t, err)
+	_, err = os.Stat(fbcFile)
+	require.True(t, os.IsNotExist(err))
+	require.False(t, store.ContentExists(catalog))
+}
+
+func TestLocalDirServerHandler(t *testing.T) {
+	jsonLineFormattedCompresableJSON, err := generateJSONLines([]byte(testCompressableJSON))
+	require.NoError(t, err)
+	yamlData, err := makeYAMLFromConcatenatedJSON([]byte(testCompressableJSON))
+	require.NoError(t, err)
+	jsonLineFormattedYamlData, err := generateJSONLines(yamlData)
+	require.NoError(t, err)
+
+	store := &LocalDirV1{RootDir: t.TempDir(), RootURL: &url.URL{Path: urlPrefix}}
+	testServer := httptest.NewServer(store.StorageServerHandler())
+	defer testServer.Close()
+
+	for _, tc := range []struct {
+		name            string
+		setupStore      func() error
+		expectStatusOK  bool
+		expectedContent string
+		URLPath         string
+	}{
+		{
+			name:            "Server returns 404 when root URL is queried",
+			setupStore:      func() error { return nil },
+			expectStatusOK:  false,
+			expectedContent: "",
+			URLPath:         "",
+		},
+		{
+			name:            "Server returns 404 when path '/' is queried",
+			setupStore:      func() error { return nil },
+			expectStatusOK:  false,
+			expectedContent: "",
+			URLPath:         "/",
+		},
+		{
+			name:            "Server returns 404 when path '/catalogs/' is queried",
+			setupStore:      func() error { return nil },
+			expectStatusOK:  false,
+			expectedContent: "",
+			URLPath:         "/catalogs/",
+		},
+		{
+			name:            "Server return 404 when path '/catalogs/test-catalog/' is queried",
+			setupStore:      func() error { return nil },
+			expectStatusOK:  false,
+			expectedContent: "",
+			URLPath:         "/catalogs/test-catalog/",
+		},
+		{
+			name:            "Server return 404 when path '/catalogs/test-catalog/api/' is queried",
+			setupStore:      func() error { return nil },
+			expectStatusOK:  false,
+			expectedContent: "",
+			URLPath:         "/catalogs/test-catalog/api/",
+		},
+		{
+			name:            "Serer return 404 when path '/catalogs/test-catalog/api/v1' is queried",
+			setupStore:      func() error { return nil },
+			expectStatusOK:  false,
+			expectedContent: "",
+			URLPath:         "/catalogs/test-catalog/api/v1c",
+		},
+		{
+			name:            "Server return 404 when path '/catalogs/test-catalog/non-existent.txt' is queried",
+			setupStore:      func() error { return nil },
+			expectStatusOK:  false,
+			expectedContent: "",
+			URLPath:         "/catalogs/test-catalog/non-existent.txt",
+		},
+		{
+			name: "Server returns 404 when path '/catalogs/test-catalog.jsonl' is queried even if the file exists, since we don't serve the filesystem, and serve an API instead",
+			setupStore: func() error {
+				return writeFile(filepath.Join(store.RootDir, "test-catalog", "catalog.jsonl"), []byte(`{"foo":"bar"}`), 0600)
+			},
+			expectStatusOK:  false,
+			expectedContent: `{"foo":"bar"}`,
+			URLPath:         "/catalogs/test-catalog.jsonl",
+		},
+		{
+			name: "Server return 200 when path '/catalogs/test-catalog/api/v1/all' is queried, when the file exists",
+			setupStore: func() error {
+				return writeFile(filepath.Join(store.RootDir, "test-catalog", "catalog.jsonl"), []byte(`{"foo":"bar"}`), 0600)
+			},
+			expectStatusOK:  true,
+			expectedContent: `{"foo":"bar"}`,
+			URLPath:         "/catalogs/test-catalog/api/v1/all",
+		},
+		{
+			name: "Ignores accept-encoding for the path /catalogs/test-catalog/api/v1/all with size < 1400 bytes",
+			setupStore: func() error {
+				return writeFile(filepath.Join(store.RootDir, "test-catalog2", "catalog.jsonl"), []byte(`{"foo":"bar"}`), 0600)
+			},
+			expectStatusOK:  true,
+			expectedContent: `{"foo":"bar"}`,
+			URLPath:         "/catalogs/test-catalog2/api/v1/all",
+		},
+		{
+			name: "provides gzipped content for the path /catalogs/test-catalog/api/v1/all with size > 1400 bytes",
+			setupStore: func() error {
+				return writeFile(filepath.Join(store.RootDir, "test-catalog3", "catalog.jsonl"), []byte(testCompressableJSON), 0600)
+			},
+			expectStatusOK:  true,
+			expectedContent: testCompressableJSON,
+			URLPath:         "/catalogs/test-catalog3/api/v1/all",
+		},
+		{
+			name: "Provides JSON-lines format for the served JSON catalog",
+			setupStore: func() error {
+				unpackResultFS := &fstest.MapFS{
+					"catalog.json": &fstest.MapFile{Data: []byte(testCompressableJSON), Mode: os.ModePerm},
+				}
+				return store.Store(context.Background(), "test-catalog4", unpackResultFS)
+			},
+			expectStatusOK:  true,
+			expectedContent: jsonLineFormattedCompresableJSON,
+			URLPath:         "/catalogs/test-catalog4/api/v1/all",
+		},
+		{
+			name:            "Provides JSON-lines format for the served YAML catalog",
+			expectStatusOK:  true,
+			expectedContent: jsonLineFormattedYamlData,
+			URLPath:         fmt.Sprintf("%s/test-catalog/api/v1/all", urlPrefix),
+			setupStore: func() error {
+				yamlData, err := makeYAMLFromConcatenatedJSON([]byte(testCompressableJSON))
+				if err != nil {
+					return err
+				}
+				unpackResultFS := &fstest.MapFS{
+					"catalog.yaml": &fstest.MapFile{Data: yamlData, Mode: os.ModePerm},
+				}
+				err = store.Store(context.Background(), "test-catalog", unpackResultFS)
+				if err != nil {
+					return err
+				}
+				return err
+			},
+		},
+	} {
+		require.NoError(t, tc.setupStore())
+		if tc.expectStatusOK {
+			req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/%s", testServer.URL, tc.URLPath), nil)
+			require.NoError(t, err)
+			req.Header.Set("Accept-Encoding", "gzip")
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+
+			var actualContent []byte
+			switch resp.Header.Get("Content-Encoding") {
+			case "gzip":
+				require.Greater(t, len(tc.expectedContent), 1400,
+					fmt.Sprintf("gzipped content should only be provided for content larger than 1400 bytes, but our expected content is only %d bytes", len(tc.expectedContent)))
+				gz, err := gzip.NewReader(resp.Body)
+				require.NoError(t, err)
+				actualContent, err = io.ReadAll(gz)
+				require.NoError(t, err)
+			default:
+				require.Less(t, len(tc.expectedContent), 1400,
+					fmt.Sprintf("plaintext content should only be provided for content smaller than 1400 bytes, but we received plaintext for %d bytes\n expectedContent:\n%s\n", len(tc.expectedContent), []byte(tc.expectedContent)))
+				actualContent, err = io.ReadAll(resp.Body)
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, []byte(tc.expectedContent), actualContent)
+			require.NoError(t, resp.Body.Close())
+		} else {
+			resp, err := http.Get(fmt.Sprintf("%s/%s", testServer.URL, tc.URLPath)) //nolint:gosec
+			require.NoError(t, err)
+			defer resp.Body.Close()
+
+			require.Equal(t, http.StatusNotFound, resp.StatusCode)
 		}
-	})
-	When("An unpacked FBC is stored using LocalDir", func() {
-		BeforeEach(func() {
-			err := store.Store(context.Background(), catalog, unpackResultFS)
-			Expect(err).To(Not(HaveOccurred()))
-		})
-		It("should store the content in the RootDir correctly", func() {
-			fbcFile := filepath.Join(rootDir, catalog, "catalog.jsonl")
-			_, err := os.Stat(fbcFile)
-			Expect(err).To(Not(HaveOccurred()))
-
-			gotConfig, err := declcfg.LoadFS(ctx, unpackResultFS)
-			Expect(err).To(Not(HaveOccurred()))
-			storedConfig, err := declcfg.LoadFile(os.DirFS(filepath.Dir(fbcFile)), filepath.Base(fbcFile))
-			Expect(err).To(Not(HaveOccurred()))
-			diff := cmp.Diff(gotConfig, storedConfig)
-			Expect(diff).To(Equal(""))
-		})
-		It("should form the content URL correctly", func() {
-			Expect(store.BaseURL(catalog)).To(Equal(baseURL.JoinPath(catalog).String()))
-		})
-		It("should report content exists", func() {
-			Expect(store.ContentExists(catalog)).To(BeTrue())
-		})
-		When("The stored content is deleted", func() {
-			BeforeEach(func() {
-				err := store.Delete(catalog)
-				Expect(err).To(Not(HaveOccurred()))
-			})
-			It("should delete the FBC from the cache directory", func() {
-				fbcFile := filepath.Join(rootDir, fmt.Sprintf("%s.jsonl", catalog))
-				_, err := os.Stat(fbcFile)
-				Expect(err).To(HaveOccurred())
-				Expect(os.IsNotExist(err)).To(BeTrue())
-
-				indexFile := filepath.Join(rootDir, fmt.Sprintf("%s.index.json", catalog))
-				_, err = os.Stat(indexFile)
-				Expect(err).To(HaveOccurred())
-				Expect(os.IsNotExist(err)).To(BeTrue())
-			})
-			It("should report content does not exist", func() {
-				Expect(store.ContentExists(catalog)).To(BeFalse())
-			})
-		})
-	})
-})
-
-var _ = Describe("LocalDir Server Handler tests", func() {
-	var (
-		testServer *httptest.Server
-		store      LocalDirV1
-	)
-	BeforeEach(func() {
-		d := GinkgoT().TempDir()
-		store = LocalDirV1{RootDir: d, RootURL: &url.URL{Path: urlPrefix}}
-		testServer = httptest.NewServer(store.StorageServerHandler())
-	})
-	It("gets 404 for the path /", func() {
-		expectNotFound(testServer.URL)
-	})
-	It("gets 404 for the path /catalogs/", func() {
-		expectNotFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs/"))
-	})
-	It("gets 404 for the path /catalogs/test-catalog/", func() {
-		expectNotFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs/test-catalog/"))
-	})
-	It("gets 404 for the path /catalogs/test-catalog/api", func() {
-		expectNotFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs/test-catalog/api"))
-	})
-	It("gets 404 for the path /catalogs/test-catalog/api/v1", func() {
-		expectNotFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs/test-catalog/api/v1"))
-	})
-	It("gets 404 for the path /catalogs/test-catalog.jsonl", func() {
-		// This is actually how the file is stored, but we don't serve
-		// the filesystem, we serve an API. Hence, expect 404 not found
-		Expect(writeFile(filepath.Join(store.RootDir, "test-catalog.jsonl"), []byte("foobar"), 0600)).To(Succeed())
-		expectNotFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs/test-catalog.jsonl"))
-	})
-	It("gets 200 for the path /catalogs/test-catalog/api/v1/all", func() {
-		expectedContent := []byte(`{"foo":"bar"}`)
-		Expect(writeFile(filepath.Join(store.RootDir, "test-catalog", "catalog.jsonl"), expectedContent, 0600)).To(Succeed())
-		expectFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs/test-catalog/api/v1/all"), expectedContent, false)
-	})
-	It("ignores accept-encoding for the path /catalogs/test-catalog/api/v1/all with size < 1400 bytes", func() {
-		expectedContent := []byte(`{"foo":"bar"}`)
-		Expect(writeFile(filepath.Join(store.RootDir, "test-catalog", "catalog.jsonl"), expectedContent, 0600)).To(Succeed())
-		expectFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs/test-catalog/api/v1/all"), expectedContent, false)
-	})
-	It("provides gzipped content for the path /catalogs/test-catalog/api/v1/all with size > 1400 bytes", func() {
-		expectedContent := []byte(testCompressableJSON)
-		Expect(writeFile(filepath.Join(store.RootDir, "test-catalog", "catalog.jsonl"), expectedContent, 0600)).To(Succeed())
-		expectFound(fmt.Sprintf("%s/%s", testServer.URL, "/catalogs/test-catalog/api/v1/all"), expectedContent, true)
-	})
-	It("provides json-lines format for the served JSON catalog", func() {
-		catalog := "test-catalog"
-		unpackResultFS := &fstest.MapFS{
-			"catalog.json": &fstest.MapFile{Data: []byte(testCompressableJSON), Mode: os.ModePerm},
-		}
-		err := store.Store(context.Background(), catalog, unpackResultFS)
-		Expect(err).To(Not(HaveOccurred()))
-
-		expectedContent, err := generateJSONLines([]byte(testCompressableJSON))
-		Expect(err).To(Not(HaveOccurred()))
-		path, err := url.JoinPath(testServer.URL, urlPrefix, catalog, "api", "v1", "all")
-		Expect(err).To(Not(HaveOccurred()))
-		expectFound(path, []byte(expectedContent), true)
-	})
-	It("provides json-lines format for the served YAML catalog", func() {
-		catalog := "test-catalog"
-		yamlData, err := makeYAMLFromConcatenatedJSON([]byte(testCompressableJSON))
-		Expect(err).To(Not(HaveOccurred()))
-		unpackResultFS := &fstest.MapFS{
-			"catalog.yaml": &fstest.MapFile{Data: yamlData, Mode: os.ModePerm},
-		}
-		err = store.Store(context.Background(), catalog, unpackResultFS)
-		Expect(err).To(Not(HaveOccurred()))
-
-		expectedContent, err := generateJSONLines(yamlData)
-		Expect(err).To(Not(HaveOccurred()))
-		path, err := url.JoinPath(testServer.URL, urlPrefix, catalog, "api", "v1", "all")
-		Expect(err).To(Not(HaveOccurred()))
-		expectFound(path, []byte(expectedContent), true)
-	})
-	AfterEach(func() {
-		testServer.Close()
-	})
-})
+	}
+}
 
 func writeFile(path string, content []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
 	return os.WriteFile(path, content, mode)
-}
-
-func expectNotFound(url string) {
-	resp, err := http.Get(url) //nolint:gosec
-	Expect(err).To(Not(HaveOccurred()))
-	Expect(resp.StatusCode).To(Equal(http.StatusNotFound))
-	Expect(resp.Body.Close()).To(Succeed())
-}
-
-func expectFound(url string, expectedContent []byte, expectCompression bool) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	Expect(err).To(Not(HaveOccurred()))
-	req.Header.Set("Accept-Encoding", "gzip")
-	resp, err := http.DefaultClient.Do(req)
-	Expect(err).To(Not(HaveOccurred()))
-	Expect(resp.StatusCode).To(Equal(http.StatusOK))
-
-	var actualContent []byte
-	if expectCompression {
-		Expect(resp.Header.Get("Content-Encoding")).To(Equal("gzip"))
-		Expect(len(expectedContent)).To(BeNumerically(">", 1400),
-			fmt.Sprintf("gzipped content should only be provided for content larger than 1400 bytes, but our expected content is only %d bytes", len(expectedContent)))
-		gz, err := gzip.NewReader(resp.Body)
-		Expect(err).To(Not(HaveOccurred()))
-		actualContent, err = io.ReadAll(gz)
-		Expect(err).To(Not(HaveOccurred()))
-	} else {
-		Expect(resp.Header.Get("Content-Encoding")).To(BeEmpty())
-		actualContent, err = io.ReadAll(resp.Body)
-		Expect(len(expectedContent)).To(BeNumerically("<", 1400),
-			fmt.Sprintf("plaintext content should only be provided for content smaller than 1400 bytes, but we received plaintext for %d bytes\n expectedContent:\n%s\n", len(expectedContent), expectedContent))
-		Expect(err).To(Not(HaveOccurred()))
-	}
-
-	Expect(actualContent).To(Equal(expectedContent))
-	Expect(resp.Body.Close()).To(Succeed())
 }
 
 const testBundleTemplate = `---
