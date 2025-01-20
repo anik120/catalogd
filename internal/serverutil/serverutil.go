@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/klauspost/compress/gzhttp"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
@@ -46,7 +45,6 @@ func AddCatalogServerToManager(mgr ctrl.Manager, cfg CatalogServerConfig, tlsFil
 	handler := cfg.LocalStorage.StorageServerHandler()
 	handler = gzhttp.GzipHandler(handler)
 	handler = catalogdmetrics.AddMetricsToHandler(handler)
-	handler = newLoggingMiddleware(handler)
 
 	catalogServer := server.Server{
 		Kind: "catalogs",
@@ -71,32 +69,4 @@ func AddCatalogServerToManager(mgr ctrl.Manager, cfg CatalogServerConfig, tlsFil
 	}
 
 	return nil
-}
-
-func newLoggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		logger := logr.FromContextOrDiscard(r.Context())
-
-		start := time.Now()
-		lrw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-		next.ServeHTTP(lrw, r)
-
-		logger.WithValues(
-			"method", r.Method,
-			"url", r.URL.String(),
-			"status", lrw.statusCode,
-			"duration", time.Since(start),
-			"remoteAddr", r.RemoteAddr,
-		).Info("HTTP request processed")
-	})
-}
-
-type loggingResponseWriter struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (w *loggingResponseWriter) WriteHeader(code int) {
-	w.statusCode = code
-	w.ResponseWriter.WriteHeader(code)
 }
